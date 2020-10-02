@@ -9,7 +9,7 @@
 :linkattrs:
 :imagesdir: ./images
 
-TODO Intro. prerequisites.
+TODO Intro. prerequisites. nullability annotations.
 
 == Why Spring Boot?
 
@@ -102,13 +102,168 @@ As with the package hierarchy, it is likely that the project structure is going 
 
 == Value Objects
 
-TODO Explain different ways of building value objects
+Now it is time to roll up our sleeves and have a closer look at some actual code. Value objects are among the simplest and most useful building blocks in domain-driven design, so let's start by looking at different ways of implementing value objects in a Spring Boot application. In order to do that, we are going to steal the concepts of _simple type_ and _complex type_ from the XML Schema specification. 
+
+A simple value object is an value object that contains exactly one value of some type, such as a single string or an integer. A complex value object is a value object that contains multiple values of multiple types, such as a postal adress complete with street name, number, postal code, city, state, country and so on. 
+
+Because we are going to persist our value objects into a relational database, we have to treat these two types differently when we implement them. However, these implementation details should not matter to the code that actually uses the value objects.
 
 === Simple Value Objects: Attribute Converters
 
+Simple value objects are very easy to persist and can be truly immutable with final fields and all. In order to persist them, you have to write an `AttributeConverter` (standard JPA interface) that knows how to convert between a database column of a known type and your value object. 
+
+Let's start with an example value object:
+
+.EmailAddress.java
+[source,java]
+----
+public class EmailAddress implements ValueObject { // <1>
+
+    private final String email; // <2>
+
+    public EmailAddress(@NotNull String email) { 
+        this.email = validate(email); // <3>
+    }
+
+    @Override
+    public @NotNull String toString() { // <4>
+        return email;
+    }
+
+    @Override
+    public boolean equals(Object o) { // <5>
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
+        EmailAddress that = (EmailAddress) o;
+        return email.equals(that.email);
+    }
+
+    @Override
+    public int hashCode() { // <6>
+        return email.hashCode();
+    }
+
+    public static @NotNull String validate(@NotNull String email) { // <7>
+        if (!isValid(email)) {
+            throw new IllegalArgumentException("Invalid email: " + email);
+        }
+        return email;
+    }
+
+    public static boolean isValid(@NotNull String email) { // <8>
+        // Validate the input string, return true or false depending on whether it is a valid e-mail address or not
+    }
+
+}
+----
+<1> `ValueObject` is an empty marker interface that resides in the `domain.base` package. It is used only for documentational purposes and has no functional meaning. You can leave it out or replace it with a custom annotation if you like to.
+<2> The string that contains the e-mail address is marked as `final`. As this is the only field in the class, it makes the class truly immutable.
+<3> The input string is validated in the constructor, making it impossible to make instances of `EmailAddress` that contain invalid data.
+<4> The e-mail address string is accessible through the `toString()` method. If you want to use this method for debugging purposes, you can use another getter method of your choice (I sometimes use an `unwrap()` method as simple value objects are essentially wrappers of other values).
+<5> Two value objects having the same value are considered equal so we have to implement the `equals()` method accordingly.
+<6> We changed `equals()` so now we have to change `hashCode()` as well.
+<7> This is a static method that is used by the constructor to validate input, but it can also be used from the outside to validate strings containing e-mail addresses. This version throws an exception if the e-mail address is invalid.
+<8> Another static method that validates e-mail address strings, but this one simply returns a boolean. This can also be used from the outside.
+
+Now, the corresponding attribute converter would look like this:
+
+.EmailAddressAttributeConverter.java
+[source,java]
+----
+@Converter // <1>
+public class EmailAddressAttributeConverter implements AttributeConverter<String, EmailAddress> { // <2>
+
+    @Override
+    @Contract("null -> null")
+    public String convertToDatabaseColumn(EmailAddress attribute) {
+        return attribute == null ? null : attribute.toString(); // <3>
+    }
+
+    @Override
+    @Contract("null -> null")
+    public EmailAddress convertToEntityAttribute(String dbData) {
+        return dbData == null ? null : new EmailAddress(dbData); // <4>
+    }
+}
+----
+<1> `@Converter` is a standard JPA annotation. If you want Hibernate to automatically apply the converter to all `EmailAddress` attributes, set the `autoApply` parameter to true (in this example it is false, which is the default).
+<2> `AttributeConverter` is a standard JPA interface that takes two generic parameters: the database column type and the attribute type.
+<3> This method converts an `EmailAddress` to a string. Please note that the input parameter can be `null`.
+<4> This method converts a string to an `EmailAddress`. Again, please note that the input parameter can be `null`.
+
+You can store the converter either in the same package as the value object, or in a sub-package (such as `.converters`) if you want to keep your domain packages nice and clean. 
+
+Finally, you can use this value object in your JPA entities like this:
+
+.Contact.java
+[source,java]
+----
+@Entity
+public class Contact {
+
+    @Convert(converter = EmailAddressAttributeConverter.class)  // <1>
+    private EmailAddress emailAddress;
+
+    // ...
+}
+----
+<1> This annotation informs JPA/Hibernate which converter to use. Without it, Hibernate will try to store the e-mail address as a serialized POJO as opposed to a string. I you have marked your converter to be automatically applied, then no `@Convert` annotation will be needed. However, I've found that it is less error-prone to explicitly state which converter to use. I have experienced situations where the converter was supposed to be auto-applied, but for some reason was not detected by Hibernate and so the value object was persisted as a serialized POJO and the integration test passed since it used an embedded H2 database and let Hibernate generate the schema.
+
+Now we are almost done with the simple value objects. However, there are two caveats that we have missed that may come back and bite us once we go into production. They both have to do with the database.
+
+The first caveat has to do with the length of the database column. By default, JPA limits the lengths of all database string (`varchar`) columns to 255 characters. E-mail addreses can be 320 characters long so if a user enters an e-mail address into the system that exceeds 255 characters, you will get an exception when you try to save the value object. To fix this, you need to do the following:
+
+1. Make sure your database column is wide enough to contain a valid e-mail address.
+2. Make sure your validation method includes a length check of the input. It should not be possible to create `EmailAddress` instances that cannot be successfully persisted.
+
+This of course applies to other string value objects as well. Depending on the use case you can either refuse to accept strings that are too long, or just silently truncate them.
+
+The second caveat has to do with legacy data. Suppose you have an existing database with e-mail addresses that were previously handled as simple strings and you now introduce a nice, clean `EmailAddress` value object. If any of those old e-mail addresses are invalid, you will get an exception every time you try to load an entity that has an invalid e-mail address: your attribute converter uses the constructor to create new `EmailAddress` instances and that constructor validates the input. To fix this you can do any of the following:
+
+1. Sanitize your database and fix or remove all invalid e-mail addresses.
+2. Create a second constructor used only by the attribute converter that bypasses the validation and instead sets an `invalid` flag inside the value object. This makes it possible to create invalid `EmailAddress` objects for existing legacy data while forcing new e-mail addresses to be correct. The code could look something like this:
+
+.EmailAddress.java
+[source,java]
+----
+public class EmailAddress implements ValueObject {
+
+    private final String email;
+    private final boolean invalid; // <1>
+
+    public EmailAddress(@NotNull String email) { 
+        this(email, true);
+    }
+
+    EmailAddress(@NotNull String email, boolean validate) { // <2>
+        if (validate) {
+            this.email = validate(email);
+            this.invalid = false;
+        } else {
+            this.email = email;
+            this.invalid = !isValid(email);
+        }
+    }
+
+    public boolean isInvalid() { // <3>
+        return invalid;
+    }
+
+    // The rest of the methods omitted
+
+}
+----
+<1> This boolean flag is used inside the value object only and is never stored in the database.
+<2> The constructor has package visibility in this example to prevent outside code from using it (we want all new e-mail objects to be valid). However, this also requires the attribute converter to be in the same package.
+<3> This flag can be passed on to UIs to indicate to the user that the e-mail address is wrong and needs to be corrected.
+
+There! We have all the cases covered and a robust and clean strategy for implementing and persisting simple value objects. However, the underlying database technology, that in principle our value object should not need to care about at all, has already managed to sneak itself into the implementation process (even though it is not really visible in the code). This is a trade-off we have to make if we want to utilize everything that JPA and Hibernate has to offer. This trade-off will be even bigger when we start do deal with complex value objects. Let's find out how.
+
 === Complex Value Objects: Embeddables
 
-== Building Entities and Aggregates
+TODO
+
+== Entities and Aggregates
 
 TODO Explain how to build entities and aggregates
 
@@ -143,3 +298,5 @@ TODO Explain how to build repositories
 == Securing Your Application
 
 == Spring Context Configuration
+
+== Flyway
