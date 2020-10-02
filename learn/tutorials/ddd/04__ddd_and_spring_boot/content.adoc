@@ -1,0 +1,145 @@
+= Domain-Driven Design, Spring Boot and Hibernate
+
+:title: Domain-Driven Design and Spring Boot
+:type: text
+:author: Petter Holmsröm
+:tags: Domain-Driven Design, Java, Backend, Architecture, Spring Boot
+:description: Learn how to use Spring Boot and Hibernate to build hexagonal, domain-driven applications
+:repo:
+:linkattrs:
+:imagesdir: ./images
+
+TODO Intro. prerequisites.
+
+== Why Spring Boot?
+
+TODO Explain why choosing Spring Boot for your domain-driven project is a good choice
+
+== Why Hibernate?
+
+TODO Explain why Hibernate is used in this article
+
+== Structuring Your Project
+
+Before you get started on your Spring Boot DDD project, you should spend some time thinking about how to set it up. How you do it depends on the size of your project, but here are a few rules of thumb to get you started. 
+
+1. You should not have more than one bounded context inside a single project. For large contexts, you can split the project up into smaller subprojects. 
+2. Follow the guidelines for domain modules (see part two of this article series about tactical DDD) when you set up your package structure.
+3. Just by looking at the package hierarchy you should be able to identify that this is a hexagonal DDD project.
+4. Set up your packages so that you can't accidentally pick up too much if you use the `@ComponentScan` annotation. As the project grows, you will need more finegrained control of the Spring configuration of your application. This also helps making your integration tests faster. For example, if you are running tests on the domain model there is no need to bring in all the ports and adapters.
+5. Create custom `@Component` annotations that explain what your Spring beans actually are in terms of the hexagonal architecture. For example, instead of just using the built in `@Service` annotation you can introduce your own `@ApplicationService` and `@DomainService` annotations. In addition to acting as documentation, this also makes it easier to write automatic tests for your architecture, for example using https://www.archunit.org/:[ArchUnit].
+
+We are now going to look at an example to further illustrate these rules in practice.
+
+=== Example: An Alerting System
+
+We are now going to look at a fictional system from a domain that is very close to me personally: the emergency services (I have been an active member of the local voluntary fire department since I was ten years old and at the time of writing I am serving as the chief of said department). Let's say we are building a new dispatch- and alerting system. Our task is to design and build the alerting context, i.e. the part of the system that receives dispatch orders from the dispatch system and sends out the alerts to the resources (fire trucks, ambulances, etc.) on the field. We already know the system will be build using Spring Boot, Hibernate and a relational database.
+
+The hexagonal architecture looks like this:
+
+image:alerting_architecture.png[The architecture of the alerting system]
+
+As you can see, the system has four ports:
+
+1. *Administration* for administering the system (adding and removing resources, modifying alert destinations, tweaking alert message formats and so on).
+2. *Data Access* for storing and retrieving the data needed by the system.
+3. *Dispatching* for receicing dispatch orders from the dispatch system (the system that emergency call operators use to enter details about emergencies).
+4. *Alerting* for sending out alerts to resources on the field.
+
+The system also has a set of adapters:
+
+1. A *Web UI* that allows administrators to administer the system through the *administration* port.
+2. *Spring Data* allows the system to access the database through the *data access* port.
+3. A *REST Controller* that the dispatch system uses to send out dispatch orders.
+4. An *SMS Gateway* that sends out alerts to resources as SMS-messages.
+5. A *Push Gateway* that sends out alerts to resources as push notifications.
+6. A *Tetra Gateway* that sends out alerts to resources as TETRA status- and text messages.
+7. A *Command System Gateway* that sends out alerts to the command systems used by different authorities on the field.
+
+What these gateways actually look like is out of scope of this article - we only need to know that they exist.
+
+Now let's have a quick look at the domain model. We have the following aggregates:
+
+1. *Dispatch Order* is a dispatch order received from the dispatch system.
+2. *Resource* is a particular resource that the dispatch order wants us to alert.
+3. *Alert Destination* is a destination to which we should send the alert message in order to alert a specific resource. One resource can have more than one alert destination and alert destinations can also be shared by multiple resources. There can be different types of alert destinations, ranging from TETRA device numbers and GSM phone numbers to usernames and device IDs.
+4. *Alert* is an alert that has been sent to a set of alert destinations in response to a dispatch order.
+5. *Alert Acknowledgement* is an acknowledgment recieved by an alert destination in response to an alert. This allows us to be sure the alert has reached its destination.
+
+With this information, we can now sketch up the following package hierarchy, sticking to the rules of thumb:
+
+* `foo.bar.main` - the Spring Boot main application class and configurations for setting everything up.
+* `foo.bar.domain.base` - Base classes, interfaces and annotations for the domain model.
+* `foo.bar.domain.infrastructure` - Helper classes that may be needed to e.g. distribute domain events in a reliable way.
+* `foo.bar.domain.model.dispatchorder` - Domain objects for the *Dispatch Order* aggregate.
+* `foo.bar.domain.model.resource` - Domain objects for the *Resource* aggregate.
+* `foo.bar.domain.model.alertdestination` - Domain objects for the *Alert Destination* aggregate.
+* `foo.bar.domain.model.alert` - Domain objects for the *Alert* aggregate.
+* `foo.bar.domain.model.alertacknowledgement` - Domain objects for the *Alert Acknowledgement* aggregate.
+* `foo.bar.application.base` - Base classes, interfaces and annotations for the application services (i.e. the ports).
+* `foo.bar.application.administration` - Interfaces and classes for the *Administration* port.
+* `foo.bar.application.dispatching` - Interfaces and classes for the *Dispatching* port.
+* `foo.bar.application.alerting` - Interfaces and classes for the *Alerting* port.
+* `foo.bar.adapter.base` - Base classes, interfaces and annotations for the adapters.
+* `foo.bar.adapter.administration.webui` - Implementation of the *Web UI*.
+* `foo.bar.adapter.dispatching.rest` - Implementation of the *REST Controller*.
+* `foo.bar.adapter.alerting.sms` - Implementation of the *SMS Gateway*.
+* `foo.bar.adapter.alerting.push` - Implementation of the *Push Gateway*.
+* `foo.bar.adapter.alerting.tetra` - Implementation of the *Tetra Gateway*.
+* `foo.bar.adapter.alerting.command` - Implementation of the *Command System Gateway*.
+
+Please note that we don't have a package for the *data access* port. This is because it is handled out of the box for us by Spring Data.
+
+It is likely that the package hierarchy will change during the development work as we learn more about the domain model, the ports and the adapters. However, this is a good starting point.
+
+Before we carry on, we are going to split this package hierarchy up into sub-projects. There are more than one way of doing this, but here is one example (we are using Maven):
+
+image:alerting_subprojects.png[The sub-projects of the alerting system]
+
+In this project structure, the domain model, the adapters and the ports all have their own sub-projects. In addition, the ports have their own API sub-projects that the adapters depend on. The main sub-project will be built into an "uberjar" that contains the entire application and will be deployed to servers.
+
+As with the package hierarchy, it is likely that the project structure is going to change as development progresses. You may end up merging some sub-projects, split up others or even introduce completely new sub-projects. However, you should always pay attention to where your dependencies point and also take into account the transitive dependencies. In the example above, you can see that each adapter can be independently changed without affecting any other parts of the system except the uberjar. Likewise, you can change your domain model without affecting the adapters as long as the ports remain the same, and so on.
+
+== Value Objects
+
+TODO Explain different ways of building value objects
+
+=== Simple Value Objects: Attribute Converters
+
+=== Complex Value Objects: Embeddables
+
+== Building Entities and Aggregates
+
+TODO Explain how to build entities and aggregates
+
+=== Using Value Objects as Aggregate Identifiers
+
+TODO Explain the challenges of using value objects as aggregate IDs in Hibernate and how to solve them
+
+== Publishing Domain Events
+
+TODO Explain how to create and publish domain events
+
+== Reacting to Domain Events
+
+TODO Explain how to receive domain events, the challenges with using @EventListener instead of @TransactionalEventListener and how to deal with errors
+
+== Distributing Domain Events
+
+TODO Explain how to distribute domain events to other contexts
+
+== Building Repositories
+
+TODO Explain how to build repositories
+
+== Building Domain Services
+
+== Application Services
+
+== Managing Transactions
+
+== Building Adapters
+
+== Securing Your Application
+
+== Spring Context Configuration
