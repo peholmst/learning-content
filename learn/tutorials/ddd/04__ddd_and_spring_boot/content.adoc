@@ -100,6 +100,55 @@ In this project structure, the domain model, the adapters and the ports all have
 
 As with the package hierarchy, it is likely that the project structure is going to change as development progresses. You may end up merging some sub-projects, split up others or even introduce completely new sub-projects. However, you should always pay attention to where your dependencies point and also take into account the transitive dependencies. In the example above, you can see that each adapter can be independently changed without affecting any other parts of the system except the uberjar. Likewise, you can change your domain model without affecting the adapters as long as the ports remain the same, and so on.
 
+== Domain Object Hierarchy
+
+Once the package structure is in place, I often continue with the base classes and interfaces for the domain model. These will all live in the `domain.base` package.
+
+Recall the following diagram from part two of this article series (tactical domain driven design):
+
+image:domain_objects.png[Hierarchy of base classes and interfaces for different domain objects]
+
+You do not have to base your domain model on a structure like this, but personally I find it helpful as it forces me to think about the rule that each domain object plays in my current bounded context (remember, that the same real-world thing may play different roles in different contexts: it may be an entity in one context, a standard type in another and a value object in a third).
+
+The top-most interface is easy because it is just a marker interface:
+
+.DomainObject.java
+[source,java]
+----
+public interface DomainObject {
+    // Marker interface
+}
+----
+
+The value object is also just a marker interface:
+
+.ValueObject.java
+[source,java]
+----
+public interface ValueObject extends DomainObject {
+    // Marker interface
+}
+----
+
+The indentifiable domain object is a bit more interesting:
+
+.IdentifiableDomainObject.java
+[source,java]
+----
+public interface IdentifiableDomainObject<Id> extends DomainObject { // <1>
+    @NotNull Optional<Id> getIdOptional(); // <2>
+
+    default @NotNull Id getId() { // <3>
+        return getIdOptional().orElseThrow();
+    }
+}
+----
+<1> We use a generic parameter for the identifier. We are going to return to why later in this article.
+<2> I prefer methods that never return null. If you generate the ID when the object is first persisted (as is typical with JPA), you have to deal with the situation that the ID can be null. If you generate the ID when the object is created, you don't have this problem at all.
+<3> The only time you would actually use the ID of a domain object is after it has been persisted. Forcing your code to deal with the `Optional` all the time is just a source of irritation and errors (because different developers will treat the `Optional` in different ways).
+
+We will look at the rest of the base classes and interfaces later in the article. Keep reading!
+
 == Value Objects
 
 Now it is time to roll up our sleeves and have a closer look at some actual code. Value objects are among the simplest and most useful building blocks in domain-driven design, so let's start by looking at different ways of implementing value objects in a Spring Boot application. In order to do that, we are going to steal the concepts of _simple type_ and _complex type_ from the XML Schema specification. 
@@ -156,7 +205,7 @@ public class EmailAddress implements ValueObject { // <1>
 
 }
 ----
-<1> `ValueObject` is an empty marker interface that resides in the `domain.base` package. It is used only for documentational purposes and has no functional meaning. You can leave it out or replace it with a custom annotation if you like to.
+<1> `ValueObject` is the empty marker interface from the `domain.base` package. It is used only for documentational purposes and has no functional meaning.
 <2> The string that contains the e-mail address is marked as `final`. As this is the only field in the class, it makes the class truly immutable.
 <3> The input string is validated in the constructor, making it impossible to make instances of `EmailAddress` that contain invalid data.
 <4> The e-mail address string is accessible through the `toString()` method. If you want to use this method for debugging purposes, you can use another getter method of your choice (I sometimes use an `unwrap()` method as simple value objects are essentially wrappers of other values).
@@ -366,7 +415,25 @@ As you can see, the underlying database and persistence technology is even more 
 
 == Entities and Aggregates
 
-TODO Explain how to build entities and aggregates
+Now when you know how to build value objects, it is time to move on to the object that will actually contain your value objects: entities and aggregates. JPA has its own `@Entity` concept, but it is far less restrictive than the entity concept from DDD. This is both an advantage and a disadvantage. The advantage is that it is quite easy to implement entities and aggregates with JPA. The disadvantage is that is is equally easy to do things that is not allowed in DDD. This may be especially problematic if you are working with developers that have used JPA extensively before but who are new to DDD.
+
+Whereas value objects just implemented an empty marker interface, entities and aggregate roots will need more extensive base classes. Getting your base classes right from the start is important as it will be quite difficult to change them later, especially if your domain model has grown big. Spring Data provides some base classes out of the box that you can use if you like, so let's start by looking at them.
+
+=== Using `AbstractPersistable` and `AbstractAggregateRoot`
+
+TODO 
+
+=== Building Your Own Base Classes
+
+TODO
+
+=== Optimistic Locking
+
+TODO
+
+=== Auditing
+
+TODO
 
 === Using Value Objects as Aggregate Identifiers
 
