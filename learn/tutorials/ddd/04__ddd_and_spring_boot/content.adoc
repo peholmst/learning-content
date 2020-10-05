@@ -278,6 +278,7 @@ Here is an example of what a finished, complex value object may look like:
 .PersonName.java
 [source,java]
 ----
+@Embeddable
 public class PersonName implements ValueObject { // <1>
 
     private String firstname; // <2>
@@ -334,6 +335,22 @@ public class PersonName implements ValueObject { // <1>
 <6> The outside world accesses the fields from getters only. There are no setters at all.
 <7> Two value objects having the same value are considered equal so we have to implement the `equals()` method accordingly.
 <8> We changed `equals()` so now we have to change `hashCode()` as well.
+
+This value object can then be used in entities like this:
+
+.Contact.java
+[source,java]
+----
+@Entity
+public class Contact {
+
+    @Embedded
+    private PersonName name;
+
+    // ...
+}
+----
+
 
 The observant reader will now notice we have again missed something: the length checks with regards to the database column widths. Just as we had to deal with that for simple value objects, we have to deal with it here. I'm going to leave it as an exercise to the reader.
 
