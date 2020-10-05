@@ -261,7 +261,91 @@ There! We have all the cases covered and a robust and clean strategy for impleme
 
 === Complex Value Objects: Embeddables
 
-TODO
+Persisting a complex value object in a relational database involves mapping multiple fields to multiple database columns. In JPA, the primary tool for this is embeddable objects (annotated with the `@Embeddable` annotation). Embeddable objects can be persisted both as single fields (annotated with the `@Embedded` annotation) or as collections (annotated with the `@ElementCollection` annotation).
+
+However, JPA imposes certain restrictions on embeddable objects that prevent them from being truly immutable. An embeddable object cannot contain any `final` fields and should have a default no-argument constructor. Still, we want to make our value objects appear and behave as if they were immutable to the outside world. How do we do that?
+
+Let's start with the constructor, or constructors, because we are going to need two of them. The first constructor is the initializing constructor, which will be public. This constructor is the only allowed way to construct new instances of the value object in code.
+
+The second constructor is the default constructor and it will only be used by Hibernate. It does not need to be public, so in order to prevent it from being used in code you can make it protected, package protected or even private (it works with Hibernate but e.g. IntelliJ IDEA will complain). Sometimes I also make a custom annotation, `@UsedByHibernateOnly` or similar, that I use to mark these constructors. You can then configure your IDE to ignore those constructors when looking for unused code.
+
+As for the fields, it is pretty simple: do not mark the fields as `final`, only set your field values from within the initializing constructor and do not declare any setter methods or other methods that write to the fields. You may also have to configure your IDE to not suggest you make those fields `final`.
+
+Finally, you need to override `equals` and `hashCode` so that they compare based on value and not based on object identity.
+
+Here is an example of what a finished, complex value object may look like:
+
+.PersonName.java
+[source,java]
+----
+public class PersonName implements ValueObject { // <1>
+
+    private String firstname; // <2>
+    private String middlename;
+    private String lastname;
+
+    @SuppressWarnings("unused")
+    PersonName() { // <3>    
+    }
+
+    public PersonName(@NotNull String firstname, @NotNull String middlename, @NotNull String lastname) { // <4>
+        this.firstname = Objects.requireNonNull(firstname);
+        this.middlename = Objects.requireNonNull(middlename);
+        this.lastname = Objects.requireNonNull(lastname);
+    }
+
+    public PersonName(@NotNull String firstname, @NotNull String lastname) { // <5>
+        this(firstname, "", lastname);
+    }
+
+    public @NotNull String getFirstname() { // <6>
+        return firstname;
+    }
+
+    public @NotNull String getMiddlename() {
+        return middlename;
+    }
+
+    public @NotNull String getLastname() {
+        return lastname;
+    }
+
+    @Override
+    public boolean equals(Object o) { // <7>
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
+        PersonName that = (PersonName) o;
+        return firstname.equals(that.firstname)
+            && middlename.equals(that.middlename)
+            && lastname.equals(that.lastname);
+    }
+
+    @Override
+    public int hashCode() { // <8>
+        return Objects.hash(firstname, middlename, lastname);
+    }
+}
+----
+<1> We use the same `ValueObject` marker interface that we used for simple value objects.
+<2> No fields are marked as `final`.
+<3> The default constructor is package protected and not used by any code at all.
+<4> The initializing constructor is to be used by code.
+<5> If not all fields are required, make overloaded constructors or use the builder or essence pattern. Forcing the calling code to pass in null or default arguments is ugly (my personal opinion).
+<6> The outside world accesses the fields from getters only. There are no setters at all.
+<7> Two value objects having the same value are considered equal so we have to implement the `equals()` method accordingly.
+<8> We changed `equals()` so now we have to change `hashCode()` as well.
+
+The observant reader will now notice we have again missed something: the length checks with regards to the database column widths. Just as we had to deal with that for simple value objects, we have to deal with it here. I'm going to leave it as an exercise to the reader.
+
+Speaking of databases, there are a few more things to think about when dealing with `@Embeddable` value objects: column names and nullability.
+
+Normally, you specify the column names inside the embeddable using the `@Column` annotation. If you leave it out, the column names are derived from the field names. This may be enough for you, but in some cases you may find yoursef using the same value object in different entities, with columns that have different names. In this case, you have to rely on the `@AttributeOverride` annotation (check it out if you are not familiar with it).
+
+Nullability has to do with how you are going to persist the state where your value object is null. For simple value objects that was easy - just store NULL in the database column. For complex value objects being stored in a collection this is also easy - just leave the value object out. For complex value objects being stored in fields, you have to check your JPA implementation.
+
+Hibernate, by default, will write NULL to all the columns if the field is null. Likewise, when reading from the database, if all columns are NULL Hibernate will set the field to nul. This is normally fine, provided that you don't actually want to have a value object instance whose fields are all set to null. This also means that even though your value object may require one or more of its fields to be not null, the database table must allow nulls in that column or columns if the entire value object can be null.
+
+As you can see, the underlying database and persistence technology is even more present in the implementation of our complex value objects than it was for the simple value objects. From a productivity perspective, this is in my opinion an acceptable tradeoff. It is possible to write the domain objects completely unaware of how they are persisted, but that will then require a lot more work in the repositories - work you would have to do yourself. Unless you have a really good reason, it is often not worth the effort (it is an interesting learning experience, though, so if you have the interest and the time then by all means give it a shot).
 
 == Entities and Aggregates
 
