@@ -136,16 +136,14 @@ The indentifiable domain object is a bit more interesting:
 [source,java]
 ----
 public interface IdentifiableDomainObject<Id> extends DomainObject { // <1>
-    @NotNull Optional<Id> getIdOptional(); // <2>
+    @NotNull Id getIdentifier(); // <2>
 
-    default @NotNull Id getId() { // <3>
-        return getIdOptional().orElseThrow();
-    }
+    boolean hasIdentifier(); // <3>
 }
 ----
 <1> We use a generic parameter for the identifier. We are going to return to why later in this article.
-<2> I prefer methods that never return null. If you generate the ID when the object is first persisted (as is typical with JPA), you have to deal with the situation that the ID can be null. If you generate the ID when the object is created, you don't have this problem at all.
-<3> The only time you would actually use the ID of a domain object is after it has been persisted. Forcing your code to deal with the `Optional` all the time is just a source of irritation and errors (because different developers will treat the `Optional` in different ways).
+<2> This method should throw an exception if the domain object does not have an ID, for example if it has not been persisted yet. I don't like methods that return null and returning an `Optional` in this case would also not be appropriate since having a null ID is the exception and not the rule. By the way, the method is intentionally named `getIdentifier` and not `getId`. We will return to why in the section about entities and aggregates.
+<3> This method is provided for the rare case when you need to check whether a domain object has an ID or not and you don't want to do this by calling `getIdentifier` and catching the excpetion.
 
 We will look at the rest of the base classes and interfaces later in the article. Keep reading!
 
@@ -419,13 +417,94 @@ Now when you know how to build value objects, it is time to move on to the objec
 
 Whereas value objects just implemented an empty marker interface, entities and aggregate roots will need more extensive base classes. Getting your base classes right from the start is important as it will be quite difficult to change them later, especially if your domain model has grown big. Spring Data provides some base classes out of the box that you can use if you like, so let's start by looking at them.
 
-=== Using `AbstractPersistable` and `AbstractAggregateRoot`
+=== Using `Persistable`, `AbstractPersistable` and `AbstractAggregateRoot`
 
-TODO 
+Spring Data provides an interface out-of-the-box called `Persistable`. This interface has two methods, one for getting the ID of the entity and another for checking whether the entity is new or persisted. If an entity implements this interface, Spring Data will use it to decide whether to call `persist` (new entities) or `merge` (persisted entities) when saving it. You are, however, not required to implement this interface. Spring Data can also use the optimistic locking version to determine whether the entity is new or not: if there is a version, it is persisted; if there is none, it is new. You need to be aware of this when you decide how you are going to generate your entity IDs.
+
+Spring Data also provides an abstract base class that implements the `Persistable` interface: `AbstractPersistable`. It is a generic class that takes the type of the ID as its single generic parameter. The ID field is annotated with `@GeneratedValue` which means that Hibernate will try to auto-generate the ID when the entity is first persisted. The class considers entities with a non-null ID as persisted and entities with null IDs as new. Finally, it overrides `equals` and `hashCode` so that only the class and the ID are taken into account when checking for equality. This is in line with DDD - two entities are considered the same if they have the same ID.
+
+If you are fine with using ordinary Java types (such as `Long` or `UUID`) for your entity IDs and letting Hibernate generate them for you when the entity is first persisted, then this base class is an excellent starting point for your entities and aggregate roots. But wait, there is more.
+
+Spring Data also provides an abstract base class called `AbstractAggregateRoot`. This is a class that - you guessed it - is designed to be extended by aggregate roots. However, it does _not_ extend `AbstractPersistable` nor does it implement the `Persistable` interface. Then why would you want to use this class? Well, it provides methods that allow your aggregate to register domain events that are then published once the entity is saved. This is really useful and we will return to this subject later in this article. In practice, you often want your aggregte roots to be `Persistable` and so you often end up implementing either the methods of `AbstractAggregteRoot` or `AbstractPersistable` in your own base class. Let's have a look at how to do that next.
 
 === Building Your Own Base Classes
 
-TODO
+In virtually all projects that I work on, both at work and in private, I start by creating my own base classes. Most of my domain models are build from aggregate roots and value objects; I rarely use so called local entities (entities that belong to an aggregate but are not roots).
+
+I often start with a base class called `BaseEntity` and it looks like this:
+
+.BaseEntity.java
+[source,java]
+----
+@MappedSuperclass // <1>
+public abstract class BaseEntity<Id extends Serializable> extends AbstractPersistable<Id> implements IdentifiableDomainObject<Id> { // <2>
+
+    @Version // <3>
+    private Long version;
+
+    public @NotNull Optional<Long> getVersion() {
+        return Optional.ofNullable(version);
+    }
+
+    protected void setVersion(@Nullable version) { // <4>
+        this.version = version;
+    }
+
+    @Override
+    @Transient
+    public @NotNull Id getIdentifier() { // <5>
+        return Optional.ofNullable(getId()).orElseThrow(() -> new IllegalStateException("No ID set"));
+    }
+
+    @Override
+    public boolean hasIdentifier() { // <6>
+        return getId() != null;
+    }
+}
+----
+<1> Even though the class is named `BaseEntity`, it is not a JPA `@Entity` but a `@MappedSuperclass`.
+<2> The `Serializable` bound comes directly from `AbstractPersistable`. Also note the use of the `IdentifiableDomainObject` interface that we declared earlier in this article.
+<3> I use optimistic locking for all my entities. We will talk briefly about this in a moment.
+<4> There are very view, if any, situation where you may want to set the optimistic locking version manually. However, to be on the safe side, I provide a protected method that makes this possible. I think most Java developers with some years under their belts have experienced situations where they would really have needed to set an attribute or call a method in a super class only to find that it was private.
+<5> This method comes from the `IdentifiableDomainObject` interface.
+<6> This method does too.
+
+Once I have the `BaseEntity` class in place, I move on to `BaseAggregateRoot`. This is essentially a copy of Spring Data's `AbstractAggregateRoot`, but it extends `BaseEntity`:
+
+.BaseAggregateRoot.java
+[source,java]
+----
+@MappedSuperclass // <1>
+public abstract class BaseAggregateRoot<Id extends Serializable> extends BaseEntity<Id> {
+
+    private final @Transient List<Object> domainEvents = new ArrayList<>(); // <2>
+
+    protected void registerEvent(@NotNull Object event) { // <3>
+        domainEvents.add(Objects.requireNonNull(event));
+    }
+
+    @AfterDomainEventPublication // <4>
+    protected void clearDomainEvents() {
+        this.domainEvents.clear();
+    }
+
+    @DomainEvents // <5>
+    protected Collection<Object> domainEvents() {
+        return Collections.unmodifiableList(domainEvents);
+    }
+}
+----
+<1> This base class is also a `@MappedSuperclass`.
+<2> This list will contain all domain events we want to publish when the aggregate is saved. It is `@Transient` because we don't want to store them in the database.
+<3> When you want to publish a domain event from within your aggregate, you register it using this protected method. We will have a closer look at this later in this article.
+<4> This is a Spring Data annotation. Spring Data will call this method after the domain events have been published.
+<5> This is also a Spring Data annotation. Spring Data will call this method to get the domain events to publish.
+
+Like I said, I rarely use local entities. However, when that need arises, I often create a `BaseLocalEntity` class that extends `BaseEntity` but does not provide any additional functionality (except, maybe a reference to the aggregate root that owns it). I will leave this as an exercise to the reader.
+
+=== Using Value Objects as Aggregate Identifiers
+
+TODO Explain the challenges of using value objects as aggregate IDs in Hibernate and how to solve them
 
 === Optimistic Locking
 
@@ -435,9 +514,6 @@ TODO
 
 TODO
 
-=== Using Value Objects as Aggregate Identifiers
-
-TODO Explain the challenges of using value objects as aggregate IDs in Hibernate and how to solve them
 
 == Publishing Domain Events
 
