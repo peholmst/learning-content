@@ -425,7 +425,7 @@ Spring Data also provides an abstract base class that implements the `Persistabl
 
 If you are fine with using ordinary Java types (such as `Long` or `UUID`) for your entity IDs and letting Hibernate generate them for you when the entity is first persisted, then this base class is an excellent starting point for your entities and aggregate roots. But wait, there is more.
 
-Spring Data also provides an abstract base class called `AbstractAggregateRoot`. This is a class that - you guessed it - is designed to be extended by aggregate roots. However, it does _not_ extend `AbstractPersistable` nor does it implement the `Persistable` interface. Then why would you want to use this class? Well, it provides methods that allow your aggregate to register domain events that are then published once the entity is saved. This is really useful and we will return to this subject later in this article. In practice, you often want your aggregte roots to be `Persistable` and so you often end up implementing either the methods of `AbstractAggregteRoot` or `AbstractPersistable` in your own base class. Let's have a look at how to do that next.
+Spring Data also provides an abstract base class called `AbstractAggregateRoot`. This is a class that - you guessed it - is designed to be extended by aggregate roots. However, it does _not_ extend `AbstractPersistable` nor does it implement the `Persistable` interface. Then why would you want to use this class? Well, it provides methods that allow your aggregate to register domain events that are then published once the entity is saved. This is really useful and we will return to this subject later in this article. Also, there are some benefits to not declaring the ID field in the base class and having your aggregate roots declare their own IDs. We will also return to this subject later. In practice, you want your aggregte roots to be `Persistable` and so you end up implementing either the methods of `AbstractAggregteRoot` or `AbstractPersistable` in your own base class. Let's have a look at how to do that next.
 
 === Building Your Own Base Classes
 
@@ -465,7 +465,7 @@ public abstract class BaseEntity<Id extends Serializable> extends AbstractPersis
 <1> Even though the class is named `BaseEntity`, it is not a JPA `@Entity` but a `@MappedSuperclass`.
 <2> The `Serializable` bound comes directly from `AbstractPersistable`. Also note the use of the `IdentifiableDomainObject` interface that we declared earlier in this article.
 <3> I use optimistic locking for all my entities. We will talk briefly about this in a moment.
-<4> There are very view, if any, situation where you may want to set the optimistic locking version manually. However, to be on the safe side, I provide a protected method that makes this possible. I think most Java developers with some years under their belts have experienced situations where they would really have needed to set an attribute or call a method in a super class only to find that it was private.
+<4> There are very few, if any, situations where you want to set the optimistic locking version manually. However, to be on the safe side, I provide a protected method that makes this possible. I think most Java developers with some years under their belts have experienced situations where they would really have needed to set an attribute or call a method in a super class only to find that it was private.
 <5> This method comes from the `IdentifiableDomainObject` interface.
 <6> This method does too.
 
@@ -503,6 +503,185 @@ public abstract class BaseAggregateRoot<Id extends Serializable> extends BaseEnt
 Like I said, I rarely use local entities. However, when that need arises, I often create a `BaseLocalEntity` class that extends `BaseEntity` but does not provide any additional functionality (except, maybe a reference to the aggregate root that owns it). I will leave this as an exercise to the reader.
 
 === Using Value Objects as Aggregate Identifiers
+
+If we briefly go back to the second part of this article series, about tactical domain driven design, we remember that the second guideline for aggregate design stated that we should refer to other aggregates by ID and use value objects to distinguish between different aggregate types (just passing `Long` or `UUID` around is a source of errors and confusion). This is perfectly possible to do with JPA and Hibernate, but requires some additional work as it goes against the design principles of JPA where you should not have to care about the IDs at all and just work your entity objects directly. Let's have a look at how.
+
+The first thought may be to use a simple value object and an attribute converter. Unfortunately this is not possible as JPA does not support using attribute converters for `@Id` fields. You can make a compromise and use "raw" IDs for your `@Id` fields and simple value objects to refer to them from other aggregates, but I do not personally like this approach as you have to move back and forth between the value objects and their wrapped raw IDs, making it more difficult to write queries. A better, more consistent approach is to create custom Hibernate types.
+
+When you create custom Hibernate types for your ID value objets, they become available for use inside your entire persistence context without any additional annotations anywhere. This involves the following steps:
+
+1. Decide what kind of raw ID type you are going to use inside your value object: `UUID`, `String`, or `Long`
+2. Create a type descriptor for your value object. This descriptor knows how to convert another value into an instance of your value object (wrap) and vice versa (unwrap).
+3. Create a custom type that ties together your type descriptor with the JDBC column type you want to use for your ID.
+4. Register your custom type with Hibernate.
+
+Let's have a look at a code example to better illustrate this. We are going to create a value object ID called `CustomerId` that wraps a `UUID`. The value object looks like this:
+
+.CustomerId.java
+[source,java]
+----
+package foo.bar.domain.model;
+
+// Imports omitted
+
+public class CustomerId implements ValueObject, Serializable { // <1>
+
+    private final UUID uuid;
+
+    public CustomerId(@NotNull UUID uuid) {
+        this.uuid = Objects.requireNonNull(uuid);
+    }
+
+    public @NotNull UUID unwrap() { // <2>
+        return uuid;
+    }
+
+    // Implementation of equals() and hashCode() omitted.
+}
+----
+<1> You have to implement the `Serializable` interface because `Persistable` assumes the ID type is persistable. I sometimes create a new marker interface called `DomainObjectId` that extends `ValueObject` and `Serializable`.
+<2> You need a way of getting the underlying `UUID` when you implement the type descriptor.
+
+Next, we will create the type descriptor. I typically place this in a subpackage called `.hibernate` to keep the domain model itself nice and clean.
+
+.CustomerIdTypeDescriptor.java
+[source,java]
+----
+package foo.bar.domain.model.hibernate;
+
+// Imports omitted
+
+public class CustomerIdTypeDescriptor extends AbstractTypeDescriptor<CustomerId> { // <1>
+
+    public CustomerIdTypeDescriptor() {
+        super(CustomerId.class);
+    }
+
+    @Override
+    public String toString(CustomerId value) { // <2>
+        return UUIDTypeDescriptor.ToStringTransformer.INSTANCE.transform(value.unwrap()); 
+    }
+
+    @Override
+    public ID fromString(String string) { // <3>
+        return new CustomerId(UUIDTypeDescriptor.ToStringTransformer.INSTANCE.parse(string)); 
+    }
+
+    @Override
+    @SuppressWarnings("unchecked")
+    public <X> X unwrap(CustomerId value, Class<X> type, WrapperOptions options) { // <4>
+        if (value == null) {
+            return null;
+        }
+        if (getJavaType().isAssignableFrom(type)) {
+            return (X) value;
+        }
+        if (UUID.class.isAssignableFrom(type)) {
+            return (X) UUIDTypeDescriptor.PassThroughTransformer.INSTANCE.transform(value.unwrap());
+        }
+        if (String.class.isAssignableFrom(type)) {
+            return (X) UUIDTypeDescriptor.ToStringTransformer.INSTANCE.transform(value.unwrap());
+        }
+        if (byte[].class.isAssignableFrom(type)) {
+            return (X) UUIDTypeDescriptor.ToBytesTransformer.INSTANCE.transform(value.unwrap());
+        }
+        throw unknownUnwrap(type);
+    }
+
+    @Override
+    public <X> CustomerId wrap(X value, WrapperOptions options) { // <5>
+        if (value == null) {
+            return null;
+        }
+        if (getJavaType().isInstance(value)) {
+            return getJavaType().cast(value);
+        }
+        if (value instanceof UUID) {
+            return new CustomerId(UUIDTypeDescriptor.PassThroughTransformer.INSTANCE.parse(value));
+        }
+        if (value instanceof String) {
+            return new CustomerId(UUIDTypeDescriptor.ToStringTransformer.INSTANCE.parse(value));
+        }
+        if (value instanceof byte[]) {
+            return new CustomerId(UUIDTypeDescriptor.ToBytesTransformer.INSTANCE.parse(value));
+        }
+        throw unknownWrap(value.getClass());
+    }
+
+    public static final CustomerIdTypeDescriptor INSTANCE = new CustomerIdTypeDescriptor(); // <6>
+}
+----
+<1> `AbstractTypeDescriptor` is a Hibernate base class that resides in the `org.hibernate.type.descriptor.java` package.
+<2> This method converts our value object to a string. We use a helper class from Hibernate's built-in `UUIDTypeDescriptor` (also from the `org.hibernate.type.descriptor.java` package) to perform the conversion.
+<3> This method constructs a value object from a string. Again, we use a helper class from `UUIDTypeDescriptor`.
+<4> This method converts a value object into a `UUID`, a string or a byte array. Again, we use helper classes from `UUIDTypeDescriptor`.
+<5> This method converts a `UUID`, a string or a byte array into a value object. The helper classes are used here as well.
+<6> We can access this type descriptor as a singleton since it does not contain any changable state.
+
+So far we have only dealt with Java types. Now it is time to bring SQL and JDBC into the mix and create our custom type:
+
+.CustomerIdType.java
+[source,java]
+----
+package foo.bar.domain.model.hibernate;
+
+// Imports omitted
+
+public class CustomerIdType extends AbstractSingleColumnStandardBasicType<CustomerId> // <1>
+    implements ResultSetIdentifierConsumer { // <2>
+
+    public CustomerIdType() {
+        super(BinaryTypeDescriptor.INSTANCE, CustomerIdTypeDescriptor.INSTANCE); // <3>
+    }
+
+    @Override
+    public Serializable consumeIdentifier(ResultSet resultSet) {
+        try {
+            var id = resultSet.getBytes(1); // <4>
+            return getJavaTypeDescriptor().wrap(id, null); // <5>
+        } catch (SQLException ex) {
+            throw new IllegalStateException("Could not extract ID from ResultSet", ex);
+        }
+    }
+
+    @Override
+    public String getName() {
+        return getJavaTypeDescriptor().getJavaType().getSimpleName(); // <6>
+    }
+}
+----
+<1> `AbstractSingleColumnStandardBasicType` is a Hibernate base class that resides in the `org.hibernate.type` package.
+<2> In order for the custom type to work properly in `@Id` fields, we have to implement this extra interface from the `org.hibernate.id` package.
+<3> Here we pass in the SQL type descriptor (in this case binary as we are going to store the UUID in a 16 byte binary column) and our Java type descriptor.
+<4> Here, we retrive the ID from a JDBC result set as a byte array...
+<5> ... and convert it to a `CustomerId` using our Java type descriptor.
+<6> A custom type needs a name so we use the name of the Java Type.
+
+Finally, we just have to register our new type with Hibernate. We will do this inside a `package-info.java` file that resides in the same package as our `CustomerId` class:
+
+.package-info.java
+[source,java]
+----
+@TypeDef(defaultForType = CustomerId.class, typeClass = CustomerIdType.class) // <1>
+package foo.bar.domain.model;
+
+import org.hibernate.annotations.TypeDef; // <2>
+import foo.bar.domain.model.hibernate.CustomerIdType;
+----
+<1> This Hibernate annotation tells Hibernate to use `CustomerIdType` whenever it encounters a `CustomerId`.
+<2> Note that the imports are coming after the annotations in a `package-info.java` file and not before as they do in a class file.
+
+Phew! Now we can use `CustomerId` both to identify `Customer` aggregates and to refer to them from other aggregates. Please keep in mind, though, that if you let Hibernate generate your SQL schema for you and you use IDs to refer to aggregates instead of `@ManyToOne` associations, Hibernate will not create foreign key constraint. You will have to do that yourself, for example using Flyway (we will return to this later in this article).
+
+But wait, haven't we forgotten something? How are we actually going to generate new `CustomerID` instances when we persist newly created `Customer` aggregate roots? Let's find out.
+
+=== Generating Value Object IDs
+
+TODO
+
+
+=== Using Composite Keys
+
 
 TODO Explain the challenges of using value objects as aggregate IDs in Hibernate and how to solve them
 
