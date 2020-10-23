@@ -854,9 +854,23 @@ A local entity is owned by its aggregate root and so is persisted through cascad
 
 By adding the optimistic locking version field to `BaseEntity`, we protect against situations like this. Both the aggregate root and the local entities will be optimistically locked and it will not be possible to accidentally overwrite somebody else's changes.
 
+== Building Repositories
+
+TODO Explain how to build repositories
+
+
 == Publishing Domain Events
 
-TODO Explain how to create and publish domain events
+From Spring's point of view, a domain event is just another application event that can be published using the built-in `ApplicationEventPublisher`. In other words, we do not need to worry about building an event bus or some other infrastructure for publishing domain events: you inject the event publisher into your bean and publish the event.
+
+Spring Data also provides a mechanism for publishing domain events directly from within aggregates without having to get a hold of the event publisher. We already touched on this mechanism when we looked at `BaseAggregateRoot` and now we are going to take a closer look at it.
+
+Under the hood, Spring Boot will register a method interceptor for all repository methods whose names start with *save*, such as `save` and `saveAndFlush`. This interceptor will look for two methods in your aggregate: one annotated with `@DomainEvents` and another annotated with `@AfterDomainEventPublication`. 
+
+TODO Write an experiment with events that contain a reference to the object being saved and saving an existing object. Which object is included in the domain event - the original one or the merged one? What implications could this have?
+
+TODO Explain how the event publisher works and how it relates to the currently active transaction (test how this works with transactions that are only controlled from the repository)
+
 
 == Reacting to Domain Events
 
@@ -866,9 +880,6 @@ TODO Explain how to receive domain events, the challenges with using @EventListe
 
 TODO Explain how to distribute domain events to other contexts
 
-== Building Repositories
-
-TODO Explain how to build repositories
 
 == Building Domain Services
 
