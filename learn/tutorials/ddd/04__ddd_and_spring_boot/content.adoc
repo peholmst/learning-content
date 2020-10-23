@@ -104,7 +104,7 @@ As with the package hierarchy, it is likely that the project structure is going 
 
 Once the package structure is in place, I often continue with the base classes and interfaces for the domain model. These will all live in the `domain.base` package.
 
-Recall the following diagram from part two of this article series (tactical domain driven design):
+Recall the following diagram from part two of this article series (tactical DDD):
 
 image:domain_objects.png[Hierarchy of base classes and interfaces for different domain objects]
 
@@ -464,7 +464,7 @@ public abstract class BaseEntity<Id extends Serializable> extends AbstractPersis
 ----
 <1> Even though the class is named `BaseEntity`, it is not a JPA `@Entity` but a `@MappedSuperclass`.
 <2> The `Serializable` bound comes directly from `AbstractPersistable`. Also note the use of the `IdentifiableDomainObject` interface that we declared earlier in this article.
-<3> I use optimistic locking for all my entities. We will talk briefly about this in a moment.
+<3> I use optimistic locking for all my entities. We will return to this later in this article.
 <4> There are very few, if any, situations where you want to set the optimistic locking version manually. However, to be on the safe side, I provide a protected method that makes this possible. I think most Java developers with some years under their belts have experienced situations where they would really have needed to set an attribute or call a method in a super class only to find that it was private.
 <5> This method comes from the `IdentifiableDomainObject` interface.
 <6> This method does too.
@@ -504,7 +504,7 @@ Like I said, I rarely use local entities. However, when that need arises, I ofte
 
 === Using Value Objects as Aggregate Identifiers
 
-If we briefly go back to the second part of this article series, about tactical domain driven design, we remember that the second guideline for aggregate design stated that we should refer to other aggregates by ID and use value objects to distinguish between different aggregate types (just passing `Long` or `UUID` around is a source of errors and confusion). This is perfectly possible to do with JPA and Hibernate, but requires some additional work as it goes against the design principles of JPA where you should not have to care about the IDs at all and just work your entity objects directly. Let's have a look at how.
+If we briefly go back to part two of this article series (tactical DDD), we remember that the second guideline for aggregate design stated that we should refer to other aggregates by ID and use value objects to distinguish between different aggregate types (just passing `Long` or `UUID` around is a source of errors and confusion). This is perfectly possible to do with JPA and Hibernate, but requires some additional work as it goes against the design principles of JPA where you should not have to care about the IDs at all and just work your entity objects directly. Let's have a look at how.
 
 The first thought may be to use a simple value object and an attribute converter. Unfortunately this is not possible as JPA does not support using attribute converters for `@Id` fields. You can make a compromise and use "raw" IDs for your `@Id` fields and simple value objects to refer to them from other aggregates, but I do not personally like this approach as you have to move back and forth between the value objects and their wrapped raw IDs, making it more difficult to write queries. A better, more consistent approach is to create custom Hibernate types.
 
@@ -829,7 +829,30 @@ Before we leave the subject of IDs, I just want to mention one thing. By moving 
 
 === Optimistic Locking
 
-TODO
+We already added a `@Version` field for optimistic locking to `BaseEntity` but we did not yet discuss why. In part two of this article series (tactical DDD), the fourth guideline for aggregate design was to use optimistic locking. We therefore now why we want to use optimistic locking. But why did we add the `@Version` field to `BaseEntity` and not to `BaseAggregateRoot`? After all, isn't it the aggregate root that is responsible for maintaining the integrity of the aggregate at all times?
+
+The answer to this question is yes, but here the underlying persistence technology (JPA/Hibernate) is again sneaking into our domain design. JPA, and therefore Hibernate, does not know what an aggregate root is - it only deals with entities and embeddables. Hibernate also keeps track of which entities have actually been changed and only flushes those changes to the database. In practice this means that even though you explicitly ask Hibernate to save an entity, no changes may actually be written to the database and the optimistic version number may be the same.
+
+As long as you only deal with aggregate roots and value objects, this is not a problem. For Hibernate, a change to an embeddable is always a change to its owning entity and so the optimistic version of the entity - in this case the aggregate root - will be incremented as expected. However, things change as soon as you add local entities to the mix. For example:
+
+.Invoice.java
+[source,java]
+----
+@Entity
+public class Invoice extends BaseAggregateRoot<InvoiceId> { // <1>
+
+    @OneToMany(cascade = CascadeType.ALL, orphanRemoval = true)
+    private Set<InvoiceItem> items; // <2>
+
+    // The rest of the methods and fields are omitted
+}
+----
+<1> `Invoice` is the aggregate root and so it extends the `BaseAggregateRoot` class.
+<2> `InvoiceItem` is a local entity and so it either extends the `BaseEntity` class or a `BaseLocalEntity` class depending on your base class hierarchy. The implementation of this class is not important so we are leaving it out, but please note the cascading options in the `@OneToMany` annotation.
+
+A local entity is owned by its aggregate root and so is persisted through cascading. However, if a change has been made only to the local entity and not to the aggregate root, saving the aggregate root will only result in the local entity being flushed to the database. In the example above, if we made a change only to an invoice item and then saved the entire invoice, the invoice optimistic version number would remain unchanged. If another user had made changes to the same item just before we saved our invoice, we would silently overwrite the other user's changes with ours. 
+
+By adding the optimistic locking version field to `BaseEntity`, we protect against situations like this. Both the aggregate root and the local entities will be optimistically locked and it will not be possible to accidentally overwrite somebody else's changes.
 
 == Publishing Domain Events
 
