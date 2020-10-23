@@ -673,26 +673,163 @@ import foo.bar.domain.model.hibernate.CustomerIdType;
 
 Phew! Now we can use `CustomerId` both to identify `Customer` aggregates and to refer to them from other aggregates. Please keep in mind, though, that if you let Hibernate generate your SQL schema for you and you use IDs to refer to aggregates instead of `@ManyToOne` associations, Hibernate will not create foreign key constraint. You will have to do that yourself, for example using Flyway (we will return to this later in this article).
 
+If you have many different ID value object types, you will want to create abstract base classes for your type descriptors and custom types to avoid having to repeat yourself. I'm going to leave this as an exercise to the reader.
+
 But wait, haven't we forgotten something? How are we actually going to generate new `CustomerID` instances when we persist newly created `Customer` aggregate roots? Let's find out.
 
 === Generating Value Object IDs
 
-TODO
+Once you have your ID value objects and custom types in place, you need a way of generating new IDs. You can create your IDs and assign them manually before persisting your entities (this is really easy if you use UUIDs) or you can configure Hibernate to automatically generate IDs for you when they are needed. The latter approach is more difficult to set up but easier to work with once it's done so let's have a look at that.
 
+JPA has support for different ID generators. If you look at the `@GeneratedValue` annotation, you can specify the name of the `generator` to use. Here we run into the first caveat. If you declare your ID field inside a mapped superclass (such as `AbstractPersistable`), there is no way for you to override the `@GeneratedValue` annotation for that field. In other words, you are stuck using the same ID generator for all of your aggregate roots and entities that extend this base class. If you find yourself in a situation like this, you have to remove your ID field from the base class and have every aggregate root and entity declare its own ID field. Thus, your `BaseEntity` class changes to something like this:
 
-=== Using Composite Keys
+.BaseEntity.java
+[source,java]
+----
+@MappedSuperclass
+public abstract class BaseEntity<Id extends Serializable> implements IdentifiableDomainObject<Id>, Persistable<Id> { // <1>
 
+    @Version
+    private Long version;
 
-TODO Explain the challenges of using value objects as aggregate IDs in Hibernate and how to solve them
+    @Override
+    @Transient 
+    public abstract @Nullable ID getId(); // <2>
+
+    @Override
+    @Transient 
+    public boolean isNew() { // <3>
+        return getId() == null;
+    }
+
+    public @NotNull Optional<Long> getVersion() {
+        return Optional.ofNullable(version);
+    }
+
+    protected void setVersion(@Nullable version) {
+        this.version = version;
+    }
+
+    @Override
+    @Transient
+    public @NotNull Id getIdentifier() {
+        return Optional.ofNullable(getId()).orElseThrow(() -> new IllegalStateException("No ID set"));
+    }
+
+    @Override
+    public boolean hasIdentifier() {
+        return getId() != null;
+    }
+
+    @Override
+    public String toString() { // <4>
+        return String.format("%s{id=%s}", getClass().getSimpleName(), getId());
+    }
+
+    @Override
+    public boolean equals(Object obj) { // <5>
+        if (null == obj) {
+            return false;
+        }
+        if (this == obj) {
+            return true;
+        }
+        if (!getClass().equals(ProxyUtils.getUserClass(obj))) { // <6>
+            return false;
+        }
+
+        var that = (BaseEntity<?>) obj;
+        var id = getId();
+        return id != null && id.equals(that.getId());
+    }
+
+    @Override
+    public int hashCode() { // <7>
+        var id = getId();
+        return id == null ? super.hashCode() : id.hashCode();
+    }
+}
+----
+<1> We no longer extend `AbstractPersistable` but we do implement the `Persistable` interface.
+<2> This method comes from the `Persistable` interface and will have to be implemented by the subclasses.
+<3> This method also comes from the `Persistable` interface.
+<4> Since we no longer extend `AbstractPersistable` we have to override `toString` ourselves to return something useful. I sometimes also include the object identity hash code to make it clear whether we are dealing with different instances of the same entity.
+<5> We also have to override `equals`. Remember that two entities of the same type with the same ID are considered the same entity.
+<6> `ProxyUtils` is a Spring utility class that is useful for cases where the JPA implementation has made bytecode changes to the entity class, resulting in `getClass()` not necessarily returning what you think it may return.
+<7> Since we have overridden `equals`, we also have to override `hashCode` in the same manner.
+
+Now when we have made the neccessary changes to `BaseEntity`, we can add the ID field to our aggregate root:
+
+.Customer.java
+[source,java]
+----
+@Entity
+public class Customer extends BaseAggregateRoot<CustomerId> { // <1>
+
+    public static final String ID_GENERATOR_NAME = "customer-id-generator"; // <2>
+
+    @Id
+    @GeneratedValue(generator = ID_GENERATOR_NAME) // <3>
+    private CustomerId id;
+
+    @Override
+    public @Nullable CustomerId getId() { // <4>
+        return id;
+    }
+}
+----
+<1> We extend `BaseAggregateRoot`, which in turn extends our refactored `BaseEntity` class.
+<2> We declare the name of the ID generator in a constant. We will be using this when we register our custom generator with Hibernate.
+<3> Now we are no longer stuck with whatever annotations where used in the mapped superclass.
+<4> We implement the abstract `getId()` method from `Persistable`.
+
+Next, we have to implement our custom ID generator. Since we are using UUIDs this is going to be almost trivial. For other ID generation strategies, I suggest you pick an existing Hibernate generator and build on that but that is out of scope of this article. The ID generator will look something like this:
+
+.CustomerIdGenerator.java
+[source,java]
+----
+package foo.bar.domain.model.hibernate;
+
+public class CustomerIdGenerator implements IdentifierGenerator { // <1>
+
+    public static final String STRATEGY = "foo.bar.domain.model.hibernate.CustomerIdGenerator"; // <2>
+
+    @Override
+    public Serializable generate(SharedSessionContractImplementor session, Object object) throws HibernateException {
+        return new CustomerId(UUID.randomUUID()); // <3>
+    }
+}
+----
+<1> `IdentifierGenerator` is an interface that resides in the `org.hibernate.id` package.
+<2> Because of how new generators are registered with Hibernate, we need the full name of the class as a string. We store it in a constant to make future refactoring easier - and minimize the risk of bugs caused by typos.
+<3> In this example we use `UUID.randomUUID()` to create new UUIDs. Please note that you have access to the Hibernate session if you need to do something more advanced, like retrieving a numeric value from a database sequence.
+
+Finally, we have to register our new ID generator with Hibernate. Like with the custom type, this happens in `package-info.java` which becomes:
+
+.package-info.java
+[source,java]
+----
+@TypeDef(defaultForType = CustomerId.class, typeClass = CustomerIdType.class)
+@GenericGenerator(name = Customer.ID_GENERATOR_NAME, strategy = CustomerIdGenerator.STRATEGY) // <1>
+package foo.bar.domain.model;
+
+import org.hibernate.annotations.GenericGenerator;
+import org.hibernate.annotations.TypeDef;
+import foo.bar.domain.model.hibernate.CustomerIdType;
+import foo.bar.domain.model.hibernate.CustomerIdGenerator;
+----
+<1> This annotation tells Hibernate to use `CustomerIdGenerator` when ever it encounters a generator named `customer-id-generator`.
+
+Double-phew! Now our domain model such just work as we expect it to, with auto-generated value objects as IDs.
+
+.Using Composite Keys
+****
+Before we leave the subject of IDs, I just want to mention one thing. By moving the ID field from the mapped superclass to the concrete entity class, we also opened up the possibility to use composite keys in our entities (either using `@EmbeddedId` or `@IdClass`). You may for example have a situation where the composite key consists of the ID of another aggregate root and an enum constant.
+****
 
 === Optimistic Locking
 
 TODO
-
-=== Auditing
-
-TODO
-
 
 == Publishing Domain Events
 
