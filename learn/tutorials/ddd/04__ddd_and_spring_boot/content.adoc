@@ -9,11 +9,17 @@
 :linkattrs:
 :imagesdir: ./images
 
-TODO Intro. prerequisites. nullability annotations.
+TODO 
+Intro. 
+prerequisites: need to have read the three previous articles, need to know Spring Boot, Spring Data, JPA and Hibernate.
+nullability annotations.
+
+TODO Check language: use can't -> cannot, isn't -> is not, it's -> it is, let's -> let us, don't mix UK and US spelling, etc.
 
 == Why Spring Boot?
 
 TODO Explain why choosing Spring Boot for your domain-driven project is a good choice
+TODO Which Spring Boot dependencies should you need?
 
 == Why Hibernate?
 
@@ -679,7 +685,7 @@ But wait, haven't we forgotten something? How are we actually going to generate 
 
 === Generating Value Object IDs
 
-Once you have your ID value objects and custom types in place, you need a way of generating new IDs. You can create your IDs and assign them manually before persisting your entities (this is really easy if you use UUIDs) or you can configure Hibernate to automatically generate IDs for you when they are needed. The latter approach is more difficult to set up but easier to work with once it's done so let's have a look at that.
+Once you have your ID value objects and custom types in place, you need a way of generating new IDs. You can create your IDs and assign them manually before persisting your entities (this is really easy if you use UUIDs) or you can configure Hibernate to automatically generate IDs for you when they are needed. The latter approach is more difficult to set up but easier to work with once it is done so let's have a look at that.
 
 JPA has support for different ID generators. If you look at the `@GeneratedValue` annotation, you can specify the name of the `generator` to use. Here we run into the first caveat. If you declare your ID field inside a mapped superclass (such as `AbstractPersistable`), there is no way for you to override the `@GeneratedValue` annotation for that field. In other words, you are stuck using the same ID generator for all of your aggregate roots and entities that extend this base class. If you find yourself in a situation like this, you have to remove your ID field from the base class and have every aggregate root and entity declare its own ID field. Thus, your `BaseEntity` class changes to something like this:
 
@@ -856,8 +862,113 @@ By adding the optimistic locking version field to `BaseEntity`, we protect again
 
 == Building Repositories
 
-TODO Explain how to build repositories
+Once we have our aggregates in place, we need to build repositories for storing and retrieving them. Building repositories in a Spring Boot application is very easy as Spring Data will basically take care of everything for you. All you need to do is declare your repository interface and have it extend the Spring Data interface `JpaRepository`. However, this also makes it easy to accidentally create repositories for local entities (which may happen if you have developers unfamiliar with DDD but familiar with JPA). Therefore, I always declare my own base repository interface like this:
 
+.BaseRepository.java
+[source,java]
+----
+@NoRepositoryBean // <1>
+public interface BaseRepository<Aggregate extends BaseAggregateRoot<ID>, ID extends Serializable> // <2>
+        extends JpaRepository<Aggregate, ID>,  // <3>
+                JpaSpecificationExecutor<Aggregate> { // <4>
+
+    default @NotNull T getById(@NotNull ID id) { // <5>
+        return findById(id).orElseThrow(() -> new EmptyResultDataAccessException(1));
+    }
+}
+----
+<1> This annotation tells Spring Data not to try to instantiate this interface directly.
+<2> We limit the entities served by the repository to aggregate roots only.
+<3> We extend `JpaRepository`.
+<4> I personally prefer specifications to query methods. We'll return to why in a little bit.
+<5> The built in `findById` method returns an `Optional`. In many cases when you fetch an aggregate by its ID you assume it will exist. Having to deal with the `Optional` every single time is a waste of time and code so you might as well do that in the repository directly.
+
+With this base interface in place, the repository for a `Customer` aggregate root could look something like this:
+
+.CustomerRepository.java
+[source,java]
+----
+public interface CustomerRepository extends BaseRepository<Customer, CustomerId> {
+    // No need for additional methods
+}
+----
+
+This is all you need for retrieving and saving aggregates. Now let us have a look at how to implement queries.
+
+=== Query Methods and Specifications
+
+The most straightfoward way to create queries in Spring Data is by defining carefully named `findBy`-methods (if you are not familiar with this then check the Spring Data reference documentation). I find these useful for simple queries that look for aggregates based on one or two keys only; for example, in a `PersonRepository` you could have a method called `findBySocialSecurityNumber` and in a `CustomerRepository` you could have a method called `findByCustomerNumber`. However, for more advanced or complex queries I try to avoid using `findBy`-methods. I do this mainly for two reasons: First, the method names tend to become very long and pollute the code wherever they are used. Second, very specific needs from application services may sneak into the repository and after a while your repositories are full of query methods that do almost the same thing but with small variations. I want to keep my domain model as clean as possible. Instead, I like to construct my queries using _specifications_. 
+
+TODO Add a refrence to specifications in the blue book
+
+When you query by specification, you start by building a specification object that describes the result you want from your query. Specification objects can also be combined using the logical operators _and_ and _or_. For maximum flexibility, I try to keep my specifications as small as possible. If needed, I create composite specifications for commonly used specification combinations.
+
+Spring Data has built in support for specifications. To create a specification, you have to implement the `Specification` interface. This interface relies on the JPA Criteria API so you need to familiarize yourself with that if you have not used it before (and also concider switching on the Hibernate metamodel generator during build). This is outside the scope of this article so I am just going to assume you know how the JPA Criteria API works and continue. The `Specification` interface contains a single method that you have to implement. It produces a JPA Criteria predicate and takes as input all the necessary objects you need to create said predicate.
+
+The easiest way of creating specifications is by making a specification factory. This is best illustrated with an example:
+
+.CustomerSpecifications.java
+[source,java]
+----
+public class CustomerSpecifications {
+
+    public @NotNull Specification<Customer> byName(@NotNull String name) {
+        return (root, query, criteriaBuilder) -> criteriaBuilder.like( // <1>
+            root.get(Customer_.name), // <2>
+            name
+        );
+    }
+
+    public @NotNull Specification<Customer> byLastInvoiceDateAfter(@NotNull LocalDate date) {
+        return (root, query, criteriaBuilder) -> criteriaBuilder.greaterThan(root.get(Customer_.lastInvoiceDate), date);
+    }
+
+    public @NotNull Specification<Customer> byLastInvoiceDateBefore(@NotNull LocalDate date) {
+        return (root, query, criteriaBuilder) -> criteriaBuilder.lessThan(root.get(Customer_.lastInvoiceDate), date);
+    }
+
+    public @NotNull Specification<Customer> activeOnly() {
+        return (root, query, criteriaBuilder) -> criteriaBuilder.isTrue(root.get(Customer_.active));
+    }
+}
+----
+<1> Here I'm just doing a simple `like` query, but in a real-world specification you would probably want to be more thorough, paying attention to wildcards, case matching and so on.
+<2> `Customer_` is a metamodel class generated by Hibernate.
+
+You would then use the specifications in the following way:
+
+.CustomerService.java
+[source,java]
+----
+public class CustomerService {
+
+    private final CustomerRepository repository;
+    private final CustomerSpecifications specifications;
+
+    public CustomerService(CustomerRepository repository, CustomerSpecifications specifications) {
+        this.repository = repository;
+        this.specifications = specifications;
+    }
+
+    public Page<Customer> findActiveCustomersByName(String name, Pageable pageable) { // <1>
+        return repository.findAll(
+            specifications.byName(name).and(specifications.activeOnly()), // <2>
+            pageable
+        );
+    }
+}
+----
+<1> Never ever write methods that return a result set without an upper bound. Either use pagination (like I do here) or use a finite and reasonable limit on how many records the query can return.
+<2> Two specifications are here combined together using the `and` operator.
+
+There is one noticeable drawback with using specifications in favor of query methods and that is unit testing where the repositories are mocked and you want to check that the incoming specifications are the correct ones. Since the specifications are using the JPA Criteria API under the hood, there is no easy way of making assertions on the contents of a given `Criteria` object without constructing and analysing its JPA predicate - a nontrivial process. However, there are ways around this. The most obvious way is to just ignore checking the incoming specifications when mocking repositories in your unit tests and use separate integration tests to test your specifications, for example with an in-memory H2 database. In many cases this may be just good enough.
+
+There is also another way that avoids the use of integration tests but requires some extra work upfront. If you take a closer look at the specifications factory, you will see that the factory methods are not static but instance methods and the class itself is not final. This means that you can mock or stub the entire factory. Also, since the factory methods only return objects that implement the `Specification` interface, you can mock or stub that interface as well. This means that as long as you avoid using the static helper methods on the `Specification` interface (which use the JPA Criteria API), you can build a mock specification factory that returns mock specifications that can then be analyzed and used as the basis for test assertions. How to do this is out of the scope of this article, but it is actually not that hard - I have thrown together a small testing framework for this in less than an hour.
+
+.A Note About Repositories and QueryDSL
+****
+Spring Data also supports QueryDSL. In this case you are not working with specifications but with QueryDSL predicates directly. The design principle is pretty much the same so if you feel more comfortable with QueryDSL than with the JPA Criteria API there is no reason for you to change.
+****
 
 == Publishing Domain Events
 
@@ -872,6 +983,12 @@ TODO Write an experiment with events that contain a reference to the object bein
 TODO Explain how the event publisher works and how it relates to the currently active transaction (test how this works with transactions that are only controlled from the repository)
 
 
+== Building Domain Services
+
+== Application Services
+
+== Managing Transactions
+
 == Reacting to Domain Events
 
 TODO Explain how to receive domain events, the challenges with using @EventListener instead of @TransactionalEventListener and how to deal with errors
@@ -880,13 +997,6 @@ TODO Explain how to receive domain events, the challenges with using @EventListe
 
 TODO Explain how to distribute domain events to other contexts
 
-
-== Building Domain Services
-
-== Application Services
-
-== Managing Transactions
-
 == Building Adapters
 
 == Securing Your Application
@@ -894,3 +1004,9 @@ TODO Explain how to distribute domain events to other contexts
 == Spring Context Configuration
 
 == Flyway
+
+== Query Objects, DTOs and Native SQL
+
+== JMX and reloadable configuration
+
+== ArchUnit
