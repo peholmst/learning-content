@@ -899,7 +899,7 @@ This is all you need for retrieving and saving aggregates. Now let us have a loo
 
 The most straightfoward way to create queries in Spring Data is by defining carefully named `findBy`-methods (if you are not familiar with this then check the Spring Data reference documentation). I find these useful for simple queries that look for aggregates based on one or two keys only; for example, in a `PersonRepository` you could have a method called `findBySocialSecurityNumber` and in a `CustomerRepository` you could have a method called `findByCustomerNumber`. However, for more advanced or complex queries I try to avoid using `findBy`-methods. I do this mainly for two reasons: First, the method names tend to become very long and pollute the code wherever they are used. Second, very specific needs from application services may sneak into the repository and after a while your repositories are full of query methods that do almost the same thing but with small variations. I want to keep my domain model as clean as possible. Instead, I like to construct my queries using _specifications_. 
 
-TODO Add a refrence to specifications in the blue book
+*TODO Add a refrence to specifications in the blue book*
 
 When you query by specification, you start by building a specification object that describes the result you want from your query. Specification objects can also be combined using the logical operators _and_ and _or_. For maximum flexibility, I try to keep my specifications as small as possible. If needed, I create composite specifications for commonly used specification combinations.
 
@@ -963,31 +963,114 @@ public class CustomerService {
 
 There is one noticeable drawback with using specifications in favor of query methods and that is unit testing where the repositories are mocked and you want to check that the incoming specifications are the correct ones. Since the specifications are using the JPA Criteria API under the hood, there is no easy way of making assertions on the contents of a given `Criteria` object without constructing and analysing its JPA predicate - a nontrivial process. However, there are ways around this. The most obvious way is to just ignore checking the incoming specifications when mocking repositories in your unit tests and use separate integration tests to test your specifications, for example with an in-memory H2 database. In many cases this may be just good enough.
 
-There is also another way that avoids the use of integration tests but requires some extra work upfront. If you take a closer look at the specifications factory, you will see that the factory methods are not static but instance methods and the class itself is not final. This means that you can mock or stub the entire factory. Also, since the factory methods only return objects that implement the `Specification` interface, you can mock or stub that interface as well. This means that as long as you avoid using the static helper methods on the `Specification` interface (which use the JPA Criteria API), you can build a mock specification factory that returns mock specifications that can then be analyzed and used as the basis for test assertions. How to do this is out of the scope of this article, but it is actually not that hard - I have thrown together a small testing framework for this in less than an hour.
+There is also another way that avoids the use of integration tests but requires some extra work upfront. If you take a closer look at the specifications factory, you will see that the factory methods are not static but instance methods and the class itself is not final. This means that you can mock or stub the entire factory. Also, since the factory methods only return objects that implement the `Specification` interface, you can mock or stub that interface as well. This means that as long as you avoid using the static helper methods on the `Specification` interface (which use the JPA Criteria API), you can build a mock specification factory that returns mock specifications that can then be analyzed and used as the basis for test assertions. Unfortunately this article is not the right place to dig deeper into this so I'll just leave it as an exercise to the reader.
 
 .A Note About Repositories and QueryDSL
 ****
 Spring Data also supports QueryDSL. In this case you are not working with specifications but with QueryDSL predicates directly. The design principle is pretty much the same so if you feel more comfortable with QueryDSL than with the JPA Criteria API there is no reason for you to change.
 ****
 
+== Building Domain Services
+
+We should try to keep most of our business logic in entities and value objects. However, there will be situations where a piece of business logic does not naturally fit into a single aggregate. In cases like this you need domain services. Building domain services in a Spring application is very easy - they are just plain old Spring beans. That said, there are a few things to keep in mind.
+
+First, domain services are not secured in anyway. You should be able to invoke them from anywhere inside your application without worrying about the security context. If the domain service really needs knowledge of the current user, it could of course look it up from the `SecurityContextHolder` but a better approach in my opinion is to pass the necessary user information as method parameters. That makes the service more stateless and easier to reuse, for example in a background thread that does not have a security context at all. Invisible contextual information that is transferred under the surface should be kept to a minimum inside the domain model.
+
+Second, domain services do not start transactions, nor do they commit or roll them back. They can participate in existing transactions or  demand that they exist, but that's about it. From a transactional point of view, domain services should always be safe to call without the risk of side effects. It is the caller of the domain service that is responsibe for starting and finishing transactions.
+
+Domain services can publish domain events if they need to, which brings us to our next topic.
+
 == Publishing Domain Events
 
-From Spring's point of view, a domain event is just another application event that can be published using the built-in `ApplicationEventPublisher`. In other words, we do not need to worry about building an event bus or some other infrastructure for publishing domain events: you inject the event publisher into your bean and publish the event.
+From Spring's point of view, a domain event is just another application event that can be published using the built-in `ApplicationEventPublisher`. In other words, we do not need to worry about building an event bus or some other infrastructure for publishing domain events: you inject the event publisher into your domain service and publish the event.
 
 Spring Data also provides a mechanism for publishing domain events directly from within aggregates without having to get a hold of the event publisher. We already touched on this mechanism when we looked at `BaseAggregateRoot` and now we are going to take a closer look at it.
 
 Under the hood, Spring Boot will register a method interceptor for all repository methods whose names start with *save*, such as `save` and `saveAndFlush`. This interceptor will look for two methods in your aggregate: one annotated with `@DomainEvents` and another annotated with `@AfterDomainEventPublication`. 
 
-TODO Write an experiment with events that contain a reference to the object being saved and saving an existing object. Which object is included in the domain event - the original one or the merged one? What implications could this have?
+The method annotated with `@DomainEvents` is expected to return a list of events to publish. The interceptor will publish these events using the Spring application event publisher. Once the events have been published, the method annotated with `@AfterDomainEventPublication` is invoked. This method is expected to clear the list of events, to prevent them from being published again the next time the aggreagte is saved.
 
-TODO Explain how the event publisher works and how it relates to the currently active transaction (test how this works with transactions that are only controlled from the repository)
+There is a caveat to keep in mind when designing and publishing domain events in this way and it has to do with events that include a reference to the aggregate root itself, for example like this:
 
+.PotentiallyProblematicDomainEvent.java
+[source,java]
+----
+public class PotentiallyProblematicDomainEvent implements DomainEvent { // <1>
+    private final MyAggregate myAggregate;
 
-== Building Domain Services
+    public PotentiallyProblematicDomainEvent(@NotNull MyAggregate myAggregate) {
+        this.myAggregate = myAggregate;
+    }
+
+    public @NotNull MyAggregate getMyAggregate() {
+        return myAggregate;
+    }
+}
+----
+<1> The `DomainEvent` interface is just a marker interface that extends the `DomainObject` marker interface.
+
+Whenever you design events like this, you have to be aware of how Spring Data and JPA work under the hood. When you save an existing entity, Spring Data will end up calling `EntityManager.merge`. If the entity is detached, JPA will retrieve the managed entity, copy all the attributes from the detached entity to the managed one, save it and return it. The managed entity will get its optimistic locking version incremented while the detached entity remains untouched. However, since the domain event was registered on the detached entity, the domain event listeners will get a reference to the detached entity. This can lead to optimistic locking errors if a listener try to perform any operations directly on the entity and then save it.
+
+Here are a few examples of cases where the listeners will end up getting a stale entity with an incorrect optimistic locking version:
+ 
+.PotentiallyProblematicApplicationService.java
+[source,java]
+----
+public class PotentiallyProblematicApplicationService {
+    
+    @Transactional
+    public void firstProblematicMethod(@NotNull MyAggregate aggregate) { // <1>
+        aggregate.performAnOperationThatRegistersAProblematicDomainEvent();
+        myAggregateRepository.saveAndFlush(aggregate);
+    }
+
+    public void secondProblematicMethod(@NotNull MyAggregateId aggregateId) { // <2>
+        var aggregate = myAggregateRepository.getById(aggregateId);
+        aggregate.performAnOperationThatRegistersAProblematicDomainEvent();
+        myAggregateRepository.saveAndFlush(aggregate);
+    }
+}
+----
+<1> This method accepts an aggregate as a parameter and performs operations on it directly. This means the aggregate is detached and will become stale once saved.
+<2> This method accepts the aggregate ID as a parameter and looks up the aggregate before performing operations on it. However, the method is not `@Transactional` which means that both calls to the repository will run inside their own transactions, detaching the aggregate in between.
+
+Now how do we address this? The second method is quite easy to fix: just make the entire method `@Transactional`. That way, the aggregate will still be managed when it is saved and the domain event listeners will get the correct instance.
+
+But what about the first method? An obvious solution would be to use the aggregate ID instead of the aggregate itself in the event. However, this has a problem of its own: if the event is registered before the aggregate has been persisted, the aggregate has no ID. If you never publish any events from unpersisted aggregates, this is not a problem. If you do, however, you can fix it like this:
+
+.SaferDomainEvent.java
+[source,java]
+----
+public class SaferDomainEvent implements DomainEvent { 
+    private final MyAggregate myAggregate;
+
+    public SaferDomainEvent(@NotNull MyAggregate myAggregate) { // <1>
+        this.myAggregate = myAggregate;
+    }
+
+    public @NotNull MyAggregateId getMyAggregateId() { // <2>
+        return myAggregate.getIdentifier();
+    }
+}
+----
+<1> We still store a reference to the aggregate inside the event...
+<2> ... but we only expose its ID to the outside world, forcing any listeners to fetch a fresh copy of the aggregate from the repository if they want to do anything with it.
+
+This is yet again an example of the underlying technology silently sneaking into your domain model - your choise of persistence technology can even affect the design of your domain events. Fortunately in this case it is not a big deal, but it is still something that may come back and bite you later if you base your early designs on assumptions that later turn out to be incorrect (I've been there and done that, especially when it comes to JPA). The bottomline is that you need to know your tools well - not only how to use them but also how they work.
 
 == Application Services
 
-== Managing Transactions
+We have now looked at all the building blocks for the domain model itself, namely value objects, entities, aggregates, repositories, domain services and domain events. However, a domain model is useless without code that actually interacts with it and this is where application services come in. I covered application services in detail in my previous article about DDD and the hexagonal architecture, but in short, an application service is an API that allows the outside world to interact with your domain model. The application service also controls the transactions and enforces security.
+
+In a Spring application, you implement application services in the same way as you implement domain services: as ordinary Spring beans. I often declare separate interfaces for my application services and keep my implementations hidden using package visibility. This emphasizes the API role that application services have. 
+
+You can handle transactions either programmatically or declaratively. In many real-world applications you often find yourself using both, so don't make any policy decisions from the start that explicitly rules out one in favor of the other. The only thing that is important is that from the caller's point of view, the service call happens inside a transaction that is started when the method call starts and committed when the method call ends (or rolled back if the method throws an exception).
+
+TODO Write something about security as well...
+
+=== Application Service Delegates
+
+TODO What if you need to split up a service into multiple parts?
 
 == Reacting to Domain Events
 
@@ -999,14 +1082,6 @@ TODO Explain how to distribute domain events to other contexts
 
 == Building Adapters
 
-== Securing Your Application
+== Next: DDD and Spring Boot From the Trenches
 
-== Spring Context Configuration
-
-== Flyway
-
-== Query Objects, DTOs and Native SQL
-
-== JMX and reloadable configuration
-
-== ArchUnit
+In the next article in this series, we are going to look at some best practices, tips and tricks, and lessons learned from real-world projects. I originally intended to include them in this article, but soon realized they would make this article way too long.

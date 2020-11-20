@@ -702,4 +702,4 @@ Since both contexts are running inside the same virtual machine, we only need on
 
 == Next: Domain-Driven Design and Spring Boot
 
-In the next and final article in this series, we are going to learn how to use Spring Boot to build applications using domain-driven design and the hexagonal architecture.
+In the next article in this series, we are going to learn how to use Spring Boot to build applications using domain-driven design and the hexagonal architecture.
